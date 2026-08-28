@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(C:\\Users\\Palan\\.claude\\skills\\mcv\\.venv\\Scripts\\python.exe *)",
+      "Bash(./watch.bat *)",
+      "Bash(git status *)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git show *)",
+      "Bash(git blame *)",
+      "Bash(Get-ScheduledTask *)",
+      "Bash(Get-ScheduledTaskInfo *)"
+    ],
+    "deny": [
+      "Read(./config.json)",
+      "Read(./auth_state.json)",
+      "Read(./notify_config.json)",
+      "Read(//Users/Palan/.claude/skills/mcv/config.json)",
+      "Read(//Users/Palan/.claude/skills/mcv/auth_state.json)",
+      "Read(//Users/Palan/.claude/skills/mcv/notify_config.json)",
+      "Read(//Users/Palan/.mcvpushnoti/config.json)",
+      "Read(//Users/Palan/.mcvpushnoti/auth_state.json)",
+      "Read(//Users/Palan/.mcvpushnoti/notify_config.json)"
+    ]
+  }
+}

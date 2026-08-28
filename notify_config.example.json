@@ -1,0 +1,6 @@
+{
+  "telegram_bot_token": "PASTE_TOKEN_FROM_BOTFATHER",
+  "telegram_chat_id": "",
+  "active_hours": [9, 23],
+  "skip_on_battery": false
+}

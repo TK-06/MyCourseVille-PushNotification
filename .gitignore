@@ -1,0 +1,30 @@
+# Runtime bookkeeping - no secrets, but no reason to track it
+notify_state.json
+watch.log
+scrape.lock
+
+# Belt and braces: the real secrets live in the data directory, never here.
+# If one ever lands in this folder by mistake, don't let it get committed.
+notify_config.json
+config.json
+auth_state.json
+
+# Crawl history - personal, large, regenerates itself
+snapshots/
+
+# Per-machine Claude Code overrides; .claude/settings.json IS committed on purpose
+.claude/settings.local.json
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

@@ -298,6 +298,99 @@ finally:
     if _tmp2.exists():
         _tmp2.unlink()
 
+print("\nthe live board -- what makes it re-send, and what stays quiet:")
+NOW = _dt(2026, 8, 29, 12, 0)
+B = lambda i, t, due: {"id": i, "title": t, "href": f"h{i}", "due_iso": due,
+                       "due_raw": "", "out_raw": "", "note": ""}
+
+
+def snap_board(*rows):
+    return {"courses": [course(C1, "2190222 DSA")], "details": {}, "assignments": {C1: list(rows)}}
+
+
+ROWS_B1 = (B("1", "HW1", "2026-09-05T23:59"),
+           B("2", "HW2", "2026-09-01T23:59"),
+           B("3", "OLD", "2026-08-01T23:59"))
+b1 = watch.open_assignments(snap_board(*ROWS_B1), NOW)
+
+check("closed assignments are off the board",
+      [r["id"] for r in b1["open"]] == ["2", "1"], [r["id"] for r in b1["open"]])
+check("closed ones are counted, not listed", b1["closed"] == 1, b1["closed"])
+
+b_un = watch.open_assignments(snap_board(B("1", "HW1", "2026-09-05T23:59"),
+                                         B("9", "NoDate", None)), NOW)
+check("undated assignments are kept aside, not dropped",
+      [r["id"] for r in b_un["undated"]] == ["9"], b_un["undated"])
+check("an undated assignment is not treated as open",
+      [r["id"] for r in b_un["open"]] == ["1"], b_un["open"])
+
+# The signature IS the send / stay-quiet decision, so it gets the most attention.
+check("an unchanged board produces an unchanged signature",
+      watch.board_signature(b1) ==
+      watch.board_signature(watch.open_assignments(snap_board(*ROWS_B1), NOW)))
+
+b_new = watch.open_assignments(snap_board(B("1", "HW1", "2026-09-05T23:59"),
+                                          B("2", "HW2", "2026-09-01T23:59"),
+                                          B("4", "HW4", "2026-09-09T23:59")), NOW)
+check("a new assignment changes the signature",
+      watch.board_signature(b_new) != watch.board_signature(b1))
+
+b_moved = watch.open_assignments(snap_board(B("1", "HW1", "2026-09-06T23:59"),
+                                            B("2", "HW2", "2026-09-01T23:59"),
+                                            B("3", "OLD", "2026-08-01T23:59")), NOW)
+check("a moved deadline changes the signature, though the id set is identical",
+      watch.board_signature(b_moved) != watch.board_signature(b1))
+
+# The trigger that fires with nothing changing on MCV's side: time crossing a band.
+SOLO = (B("1", "HW1", "2026-08-31T12:00"),)          # 48h out from NOW -> yellow
+early = watch.open_assignments(snap_board(*SOLO), NOW)
+later = watch.open_assignments(snap_board(*SOLO), _dt(2026, 8, 30, 20, 0))   # 16h -> red
+mid = watch.open_assignments(snap_board(*SOLO), _dt(2026, 8, 29, 14, 0))     # 46h -> still yellow
+
+check("crossing into the 24h band changes the signature",
+      watch.board_signature(early) != watch.board_signature(later))
+check("...and only the band changed, not the underlying row",
+      [s.rsplit("|", 1)[0] for s in watch.board_signature(early)] ==
+      [s.rsplit("|", 1)[0] for s in watch.board_signature(later)])
+check("drifting within a band stays quiet",
+      watch.board_signature(early) == watch.board_signature(mid))
+
+gone = watch.open_assignments(snap_board(*SOLO), _dt(2026, 9, 1, 12, 0))
+check("an assignment closing changes the signature",
+      watch.board_signature(gone) != watch.board_signature(early))
+check("a board with nothing open is empty but still counts the closed one",
+      gone["open"] == [] and gone["closed"] == 1)
+
+# Rendering.
+msg = watch.format_board(b1)
+check("the board lists every open assignment", "HW1" in msg and "HW2" in msg)
+check("the board omits closed ones", "OLD" not in msg)
+check("the board leads with the open count", "2" in msg.split("\n")[0])
+check("the board dates each row", "05 Sep" in msg and "01 Sep" in msg)
+check("the board sorts soonest first", msg.index("HW2") < msg.index("HW1"))
+check("an empty board says so", "Nothing due" in watch.format_board(gone))
+check("undated assignments are surfaced in the render",
+      "no readable due date" in watch.format_board(b_un))
+
+# The what-changed headline that leads the scheduled message.
+head = watch.board_headline(b_new, watch.board_signature(b1), {
+    "new_assignments": [{"id": "4", "title": "HW4", "course": "2190222 DSA",
+                         "due_iso": "2026-09-09T23:59", "href": "h4"}],
+    "changed_assignments": [],
+})
+check("the headline names a new assignment", any("HW4" in l for l in head), head)
+
+band_head = watch.board_headline(later, watch.board_signature(early), None)
+check("the headline calls out a band crossing", any("HW1" in l for l in band_head), band_head)
+check("a quiet drift produces no headline",
+      watch.board_headline(mid, watch.board_signature(early), None) == [])
+check("with no previous signature there is no band headline",
+      watch.board_headline(later, None, None) == [])
+
+# Page-link changes still get through, demoted under the board.
+foot = watch.format_page_changes(d)
+check("page changes still render as a footer", any("NEW COURSE" in l for l in foot), foot)
+
 if failures:
     print(f"\n{len(failures)} FAILURE(S):")
     for f in failures:

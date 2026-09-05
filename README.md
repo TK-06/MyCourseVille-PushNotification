@@ -26,12 +26,16 @@ Task Scheduler (every 30 min, 09:00-23:00)
         |          crawls dashboard, every course page,
         |          and every course's Assignments tab
         v
-   diff vs. snapshots/latest.json
-        |          new assignment? deadline moved? new material?
+   build the board: every assignment still open, soonest first
+        |          then diff vs. snapshots/latest.json to decide whether to send
         |
-   nothing changed? ---> exit 0, silently (this is the usual case)
+   board reads the same? ---> exit 0, silently (this is the usual case)
         |
-   something changed? ---> Telegram message ---> your phone
+   new assignment, moved deadline, a deadline crossing into
+   72h or 24h, or new course material?
+        |
+        +---> Telegram message ---> your phone
+              (the whole open-assignment board, with what changed on top)
 
 
 watch.py listen  (separate process, starts at logon)
@@ -141,7 +145,8 @@ A message should land on your phone.
 
 ### 4. Write the baseline
 
-The first successful run has nothing to compare against, so it stays quiet by design:
+The first successful run has no previous board to compare against, so it sends you the
+current open-assignment list and stores it as the baseline:
 
 ```powershell
 .\watch.bat run --force
@@ -341,7 +346,7 @@ Two things worth knowing:
 | `watch.bat courses` | Print course codes and seed `courses.json` with short names. |
 | `watch.bat chatid` | Look up your Telegram chat id. |
 | `watch.bat listen` | Run the Telegram command listener in the foreground (the scheduled task does this for you). |
-| `python test_diff.py` | Offline checks on the diff logic. No network, no MCV, no Telegram. |
+| `python test_diff.py` | Offline checks on the diff and board logic. No network, no MCV, no Telegram. |
 
 ### Config (`notify_config.json`, in the data directory)
 
@@ -450,7 +455,7 @@ mcvPushNoti/
 ├── watch.py                     the watcher and the Telegram listener
 ├── mcvclient.py                 login + scraping (vendored; no skill dependency)
 ├── watch.bat                    manual runner (finds a venv for you)
-├── test_diff.py                 offline checks, no network (62 assertions)
+├── test_diff.py                 offline checks, no network (94 assertions)
 ├── courses.json                 course code -> the name you actually use
 ├── notify_config.example.json   template — the real one goes in the data dir
 ├── requirements.txt

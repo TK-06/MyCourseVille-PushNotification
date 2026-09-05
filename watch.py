@@ -1,7 +1,8 @@
 """MyCourseVille watcher — headless poll, diff, push to Telegram.
 
 Usage:
-    python watch.py                 # the scheduled run: snapshot, diff, notify only if something changed
+    python watch.py                 # the scheduled run: snapshot, then push the open-assignment
+                                    #   board if it reads differently than last time
     python watch.py --force         # same, but ignore the active-hours window
     python watch.py check           # scrape now and message either way; leaves the baseline alone
     python watch.py due             # list every assignment still open, soonest first
@@ -177,6 +178,12 @@ def telegram_call(token: str, method: str, params: dict | None = None, timeout: 
         raise RuntimeError(f"Telegram {method} failed ({e.code}): {body}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Telegram {method} unreachable: {e.reason}") from e
+    except (TimeoutError, ConnectionError, json.JSONDecodeError) as e:
+        # Read-phase timeouts (socket.timeout IS TimeoutError on 3.13, not a URLError),
+        # dropped connections, and captive-portal HTML served as a 200 all land here
+        # rather than in the handlers above. The long-poll listener treats RuntimeError
+        # as "blip, retry" -- make sure these reach it as one instead of killing it.
+        raise RuntimeError(f"Telegram {method} failed ({type(e).__name__}): {e}") from e
 
 
 def send(cfg: dict, text: str) -> None:
@@ -521,6 +528,141 @@ def fmt_delta(target: datetime, now: datetime) -> str:
     return f"{s} overdue" if overdue else f"in {s}"
 
 
+# --------------------------------------------------------------------------- the board
+
+# The scheduled run's message is this board — every assignment still open, soonest
+# first — not a diff. The diff decides *whether* to send; the board is what you read.
+#
+# Bands are the urgency dots promoted to a decision. Because the band is part of the
+# signature, a deadline sliding from 72h to 24h re-sends the board on its own, with
+# nothing having changed on MCV's side. That is the whole point: the thing most likely
+# to hurt you is a deadline you already knew about and stopped thinking about.
+URGENCY_BANDS = ((24, "red", "🔴"), (72, "yellow", "🟡"))
+URGENCY_DEFAULT = ("green", "🟢")
+BOARD_LIMIT = 25
+
+
+def urgency(due: datetime, now: datetime) -> tuple[str, str]:
+    """(band, dot) for a due date. The band drives re-sends; the dot is just display."""
+    hrs = (due - now).total_seconds() / 3600
+    for limit, band, dot in URGENCY_BANDS:
+        if hrs < limit:
+            return band, dot
+    return URGENCY_DEFAULT
+
+
+def open_assignments(snap: dict, now: datetime | None = None) -> dict:
+    """Split a snapshot's assignments into open / closed / undated.
+
+    Shared by `due` and the scheduled run so the two can never drift into showing
+    different pictures of the same snapshot.
+    """
+    now = now or datetime.now()
+    names = {c["href"]: c["text"] for c in snap.get("courses", [])}
+    dated, undated = [], []
+    for href, items in (snap.get("assignments") or {}).items():
+        for r in items:
+            rec = {**r, "course": names.get(href, href)}
+            (dated if r.get("due_iso") else undated).append(rec)
+    open_rows = sorted(
+        (r for r in dated if datetime.fromisoformat(r["due_iso"]) >= now),
+        key=lambda r: r["due_iso"],
+    )
+    return {"open": open_rows, "closed": len(dated) - len(open_rows),
+            "undated": undated, "now": now}
+
+
+def board_signature(board: dict) -> list[str]:
+    """A stable description of what the board says, for comparing against last time.
+
+    Sorted rather than in display order — reordering alone is not news. Undated rows
+    are included by id so one appearing still counts as something to tell you about.
+    """
+    sig = [f"{r.get('id')}|{r['due_iso']}|{urgency(datetime.fromisoformat(r['due_iso']), board['now'])[0]}"
+           for r in board["open"]]
+    sig += [f"{r.get('id')}|undated" for r in board["undated"]]
+    return sorted(sig)
+
+
+def board_headline(board: dict, prev_sig: list[str] | None, d: dict | None) -> list[str]:
+    """The 'what changed' lines that sit above the board.
+
+    Band crossings are recovered from the previous signature rather than from extra
+    state — the band is already encoded in it, so there is nothing else to store.
+    """
+    lines = []
+    for a in (d or {}).get("new_assignments", []):
+        lines.append(f"🆕 <b>New:</b> {esc(a['title'][:60])} <i>({esc(course_label(a['course']))})</i>")
+    for a in (d or {}).get("changed_assignments", []):
+        when = "no due date"
+        if a.get("due_iso"):
+            when = f"{datetime.fromisoformat(a['due_iso']):%a %d %b %H:%M}"
+        lines.append(f"⏰ <b>Deadline moved:</b> {esc(a['title'][:60])} → {esc(when)}")
+    if prev_sig:
+        was = {}
+        for s in prev_sig:
+            parts = s.split("|")
+            if len(parts) == 3:
+                was[parts[0]] = parts[2]
+        for r in board["open"]:
+            due = datetime.fromisoformat(r["due_iso"])
+            band, dot = urgency(due, board["now"])
+            if band in ("red", "yellow") and was.get(str(r.get("id"))) not in (None, band):
+                lines.append(f"{dot} <b>Now {esc(fmt_delta(due, board['now']))}:</b> "
+                             f"{esc(r['title'][:60])}")
+    return lines
+
+
+def format_board(board: dict, headline: list[str] | None = None,
+                 extra: list[str] | None = None) -> str:
+    """Render the board. `headline` leads it, `extra` (page-link changes) trails it."""
+    now, open_rows = board["now"], board["open"]
+    lines = [f"📋 <b>Open assignments — {len(open_rows)}</b>"]
+    if headline:
+        lines.append("")
+        lines += headline
+    if not open_rows:
+        lines.append("\nNothing due. Every assignment found has passed its deadline.")
+    for r in open_rows[:BOARD_LIMIT]:
+        due = datetime.fromisoformat(r["due_iso"])
+        lines.append(
+            f"\n{urgency(due, now)[1]} <a href=\"{esc(r['href'])}\">{esc(r['title'][:80])}</a>"
+            f"\n    {esc(course_label(r['course']))} · due {due:%a %d %b %H:%M}"
+            f" · <b>{esc(fmt_delta(due, now))}</b>"
+        )
+    if len(open_rows) > BOARD_LIMIT:
+        lines.append(f"\n… and {len(open_rows) - BOARD_LIMIT} more")
+    if board["undated"]:
+        lines.append(f"\n\n❔ {len(board['undated'])} assignment(s) with no readable due date")
+    if extra:
+        lines.append("")
+        lines += extra
+    lines.append(f"\n<i>{board['closed']} already closed · checked {now:%a %d %b %H:%M}</i>")
+    return "\n".join(lines)
+
+
+def format_page_changes(d: dict) -> list[str]:
+    """Course-page link changes, demoted to a footer under the board.
+
+    Still reported — the project's bias is that a spurious ping costs two seconds and
+    a missed deadline doesn't — but no longer the headline act.
+    """
+    lines = []
+    if d.get("new_courses"):
+        lines.append("🆕 <b>New courses</b>")
+        lines += [f"  • {esc(c[:90])}" for c in sorted(d["new_courses"])]
+        lines.append("  <i>added to courses.json - give them short names</i>")
+    if d.get("gone_courses"):
+        lines.append("➖ <b>Courses gone</b>")
+        lines += [f"  • {esc(c[:90])}" for c in sorted(d["gone_courses"])]
+    for course, items in sorted(d.get("per_course", {}).items()):
+        lines.append(f"📌 <b>{esc(course[:70])}</b> — {len(items)} new link(s)")
+        lines += [f"  + {esc(it[:110])}" for it in items[:6]]
+        if len(items) > 6:
+            lines.append(f"  … and {len(items) - 6} more")
+    return lines
+
+
 # --------------------------------------------------------------------------- scraping
 
 
@@ -682,19 +824,33 @@ def cmd_run(force: bool = False) -> int:
 
     prev = persist(snap)
     if prev is None:
-        log(f"baseline snapshot written ({len(snap['courses'])} courses) - nothing to diff yet")
+        log(f"baseline snapshot written ({len(snap['courses'])} courses)")
+
+    board = open_assignments(snap)
+    sig = board_signature(board)
+    prev_sig = state.get("board_sig")
+    d = diff(prev, snap) if prev is not None else None
+
+    # Either the assignments or the course pages can be the reason to send, but the
+    # board leads the message either way. Editing a pinned board in place was the
+    # other option and was dropped: Telegram edits are silent, so it would never
+    # once reach the phone.
+    page_changes = bool(d and (d["new_courses"] or d["gone_courses"] or d["per_course"]))
+    if prev_sig is not None and sig == prev_sig and not page_changes:
+        log(f"no change ({len(board['open'])} open, {len(snap['courses'])} courses)")
         save_state(state)
         return 0
 
-    d = diff(prev, snap)
-    if not has_changes(d):
-        log(f"no changes ({len(snap['courses'])} courses)")
-        save_state(state)
-        return 0
-
-    send(cfg, format_message(d))
-    n = sum(len(v) for v in d["per_course"].values()) + len(d["new_courses"]) + len(d["gone_courses"])
-    log(f"notified: {n} change(s)")
+    send(cfg, format_board(
+        board,
+        headline=board_headline(board, prev_sig, d),
+        extra=format_page_changes(d) if page_changes else None,
+    ))
+    extra_note = ""
+    if page_changes:
+        extra_note = f", {sum(len(v) for v in d['per_course'].values())} page change(s)"
+    log(f"notified: board of {len(board['open'])} open{extra_note}")
+    state["board_sig"] = sig
     state["last_notified_at"] = datetime.now().isoformat(timespec="seconds")
     save_state(state)
     return 0
@@ -761,42 +917,12 @@ def cmd_due() -> int:
         log("due: session expired")
         return 2
 
-    now = datetime.now()
-    names = {c["href"]: c["text"] for c in snap["courses"]}
-    dated, undated = [], []
-    for href, items in snap.get("assignments", {}).items():
-        for r in items:
-            rec = {**r, "course": names.get(href, href)}
-            (dated if r.get("due_iso") else undated).append(rec)
-
-    open_rows = sorted(
-        (r for r in dated if datetime.fromisoformat(r["due_iso"]) >= now),
-        key=lambda r: r["due_iso"],
-    )
-    closed = len(dated) - len(open_rows)
-
-    lines = [f"📋 <b>Open assignments — {len(open_rows)}</b>"]
-    if not open_rows:
-        lines.append("\nNothing due. Every assignment found has passed its deadline.")
-    for r in open_rows[:25]:
-        due = datetime.fromisoformat(r["due_iso"])
-        hrs = (due - now).total_seconds() / 3600
-        dot = "🔴" if hrs < 24 else "🟡" if hrs < 72 else "🟢"
-        lines.append(
-            f"\n{dot} <a href=\"{esc(r['href'])}\">{esc(r['title'][:80])}</a>"
-            f"\n    {esc(course_label(r['course']))} · due {due:%a %d %b %H:%M} · <b>{esc(fmt_delta(due, now))}</b>"
-        )
-    if len(open_rows) > 25:
-        lines.append(f"\n… and {len(open_rows) - 25} more")
-    if undated:
-        lines.append(f"\n\n❔ {len(undated)} assignment(s) with no readable due date")
-    lines.append(f"\n<i>{closed} already closed · checked {now:%a %d %b %H:%M}</i>")
-
-    msg = "\n".join(lines)
+    board = open_assignments(snap)
+    msg = format_board(board)
     send(cfg, msg)
     # Console view, without the HTML tags.
     print(re.sub(r"<[^>]+>", "", msg))
-    log(f"due: {len(open_rows)} open, {closed} closed")
+    log(f"due: {len(board['open'])} open, {board['closed']} closed")
     return 0
 
 
@@ -876,8 +1002,8 @@ HELP_TEXT = (
     "/check — scrape now and report either way\n"
     "/status — is the watcher healthy?\n"
     "/help — this message\n\n"
-    "<i>You don't need to ask. New assignments and moved deadlines "
-    "arrive on their own every 30 minutes, 09:00–23:00.</i>"
+    "<i>You don't need to ask. The board arrives on its own whenever it changes "
+    "- a new assignment, a moved deadline, or one closing in - checked every 30 minutes, 09:00–23:00.</i>"
 )
 
 BOT_COMMANDS = [
@@ -946,9 +1072,11 @@ def cmd_listen() -> int:
                 {"timeout": 50, "offset": offset, "allowed_updates": json.dumps(["message"])},
                 timeout=70,
             )
-        except RuntimeError as e:
+        except Exception as e:
             # Wifi drops and Telegram blips are expected; back off and keep going.
-            log(f"listener: poll failed ({str(e)[:120]}) — retrying in 15s")
+            # Catch broadly on purpose: a crashed listener stays dead until the next
+            # logon, so no transient error is worth letting through here.
+            log(f"listener: poll failed ({type(e).__name__}: {str(e)[:100]}) - retrying in 15s")
             time.sleep(15)
             continue
 
